@@ -472,37 +472,78 @@ class SchedulerJob(BaseJob):
             session
             .query(
                 TI.task_id,
-                func.max(TI.execution_date).label('max_ti'))
+                func.max(TI.execution_date).label('max_ti'),
+                TI.start_date,
+            )
             .with_hint(TI, 'USE INDEX (PRIMARY)', dialect_name='mysql')
             .filter(TI.dag_id == dag.dag_id)
             .filter(or_(
+                TI.state == State.RUNNING,
                 TI.state == State.SUCCESS,
                 TI.state == State.SKIPPED))
             .filter(TI.task_id.in_(dag.task_ids))
-            .group_by(TI.task_id).subquery('sq')
+            .group_by(TI.task_id, TI.start_date)
+            .subquery('sq')
         )
+        
 
         max_tis = session.query(TI).filter(
             TI.dag_id == dag.dag_id,
             TI.task_id == sq.c.task_id,
             TI.execution_date == sq.c.max_ti,
+            TI.start_date == sq.c.start_date,
         ).all()
 
         ts = timezone.utcnow()
-        for ti in max_tis:
-            task = dag.get_task(ti.task_id)
-            dttm = ti.execution_date
-            if isinstance(task.sla, timedelta):
-                dttm = dag.following_schedule(dttm)
-                while dttm < timezone.utcnow():
-                    following_schedule = dag.following_schedule(dttm)
-                    if following_schedule + task.sla < timezone.utcnow():
-                        session.merge(SlaMiss(
-                            task_id=ti.task_id,
-                            dag_id=ti.dag_id,
-                            execution_date=dttm,
-                            timestamp=ts))
-                    dttm = dag.following_schedule(dttm)
+        if "sla" in dag.default_args:
+            for ti in max_tis:
+                task = dag.get_task(ti.task_id)
+                if task.sla and not isinstance(task.sla, timedelta):
+                    raise TypeError(
+                        f"SLA is expected to be timedelta object, got "
+                        f"{type(task.sla)} in {task.dag_id}:{task.task_id}"
+                    )
+                task_sla_check = ti.start_date + task.sla < timezone.utcnow()
+                dag_sla_check = ti.execution_date + dag.default_args["sla"] < timezone.utcnow()
+                if task_sla_check or dag_sla_check:
+                    self.log.info(
+                        "\nTask ID:%s\nExec date:%s\nStart Date:%s\nDAG run:%s\nSLA:%s\nCurrent time: %s",
+                        ti.task_id,
+                        ti.execution_date,
+                        ti.start_date,
+                        dag.get_dagrun(ti.execution_date).run_id,
+                        task.sla,
+                        ts
+                    )
+                    session.merge(SlaMiss(
+                        task_id=ti.task_id,
+                        dag_id=ti.dag_id,
+                        execution_date=ti.execution_date,
+                        timestamp=ts))
+        else:
+            for ti in max_tis:
+                task = dag.get_task(ti.task_id)
+                if task.sla and not isinstance(task.sla, timedelta):
+                    raise TypeError(
+                        f"SLA is expected to be timedelta object, got "
+                        f"{type(task.sla)} in {task.dag_id}:{task.task_id}"
+                    )
+
+                if ti.start_date + task.sla < timezone.utcnow():
+                    self.log.info(
+                        "\nTask ID:%s\nExec date:%s\nStart Date:%s\nDAG run:%s\nSLA:%s\nCurrent time: %s",
+                        ti.task_id,
+                        ti.execution_date,
+                        ti.start_date,
+                        dag.get_dagrun(ti.execution_date).run_id,
+                        task.sla,
+                        ts
+                    )
+                    session.merge(SlaMiss(
+                        task_id=ti.task_id,
+                        dag_id=ti.dag_id,
+                        execution_date=ti.execution_date,
+                        timestamp=ts))
         session.commit()
 
         slas = (
