@@ -478,9 +478,7 @@ class SchedulerJob(BaseJob):
             .with_hint(TI, 'USE INDEX (PRIMARY)', dialect_name='mysql')
             .filter(TI.dag_id == dag.dag_id)
             .filter(or_(
-                TI.state == State.RUNNING,
-                TI.state == State.SUCCESS,
-                TI.state == State.SKIPPED))
+                TI.state == State.RUNNING))
             .filter(TI.task_id.in_(dag.task_ids))
             .group_by(TI.task_id, TI.start_date)
             .subquery('sq')
